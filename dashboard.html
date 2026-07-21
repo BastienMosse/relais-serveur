@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Relais — Console</title>
+<style>
+  :root{
+    --bg:#0b0f0e;
+    --bg-elev:#111715;
+    --bg-row:#0f1513;
+    --line:#1f2b27;
+    --text:#dfe8e4;
+    --text-dim:#7d938c;
+    --mint:#5ee6b0;
+    --mint-dim:#2c5346;
+    --amber:#f2b866;
+    --red:#e2685f;
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;}
+  body{
+    margin:0; background:var(--bg); color:var(--text); font-family:var(--sans);
+    display:flex; flex-direction:column;
+  }
+  header{
+    display:flex; align-items:center; gap:14px;
+    padding:14px 20px; border-bottom:1px solid var(--line); background:var(--bg-elev);
+    flex-shrink:0;
+  }
+  .brand{display:flex; align-items:center; gap:10px;}
+  .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--mint); box-shadow:0 0 8px var(--mint);}
+  .brand .dot.off{background:var(--red); box-shadow:0 0 8px var(--red);}
+  .brand h1{font-size:15px; font-weight:600; letter-spacing:.02em; margin:0;}
+  .brand small{color:var(--text-dim); font-family:var(--mono); font-size:11px;}
+  .stats{display:flex; gap:18px; margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--text-dim);}
+  .stats b{color:var(--mint); font-weight:600;}
+  .toolbar{
+    display:flex; gap:10px; padding:10px 20px; border-bottom:1px solid var(--line);
+    background:var(--bg-elev); flex-shrink:0; align-items:center;
+  }
+  .toolbar input[type=text]{
+    flex:1; max-width:320px; background:var(--bg); border:1px solid var(--line); color:var(--text);
+    padding:7px 10px; border-radius:6px; font-family:var(--mono); font-size:12.5px; outline:none;
+  }
+  .toolbar input[type=text]:focus{border-color:var(--mint-dim);}
+  .toolbar button{
+    background:var(--bg); border:1px solid var(--line); color:var(--text-dim);
+    padding:7px 12px; border-radius:6px; font-family:var(--sans); font-size:12.5px; cursor:pointer;
+  }
+  .toolbar button.active{border-color:var(--mint); color:var(--mint);}
+  .toolbar button:hover{color:var(--text);}
+  .body{flex:1; display:flex; flex-direction:column; min-height:0;}
+  .list{flex:1; overflow-y:auto; display:flex; flex-direction:column-reverse; min-height:0;}
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  thead th{
+    position:sticky; top:0; background:var(--bg-elev); text-align:left; padding:8px 14px;
+    color:var(--text-dim); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+    border-bottom:1px solid var(--line); z-index:1;
+  }
+  tbody tr{
+    cursor:pointer; border-bottom:1px solid var(--line);
+  }
+  tbody tr:hover{background:var(--bg-row);}
+  tbody tr.selected{background:var(--mint-dim);}
+  td{padding:8px 14px; vertical-align:middle; white-space:nowrap;}
+  td.time{color:var(--text-dim); font-family:var(--mono); font-size:11.5px;}
+  td.who{font-family:var(--mono); font-size:12.5px;}
+  td.who .arrow{color:var(--text-dim); margin:0 6px;}
+  .badge{
+    display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-family:var(--mono);
+    border:1px solid var(--line); color:var(--text-dim);
+  }
+  .badge.register, .badge.register_ok{color:var(--mint); border-color:var(--mint-dim);}
+  .badge.register_denied, .badge.envelope_refused{color:var(--red); border-color:#4a2724;}
+  .badge.envelope{color:var(--amber); border-color:#5a4726;}
+  .badge.pair_request{color:#8fb8ff; border-color:#243a5a;}
+  .badge.disconnect, .badge.challenge, .badge.register_auth{color:var(--text-dim);}
+  .status-tag{font-size:10.5px; color:var(--text-dim); margin-left:6px;}
+  .status-tag.queued{color:var(--amber);}
+  .status-tag.error{color:var(--red);}
+  .detail{
+    display:none; /* masqué tant qu'aucune transaction n'est sélectionnée / après fermeture */
+    height:300px; flex-shrink:0; border-top:1px solid var(--line); background:var(--bg-elev);
+    flex-direction:column; overflow:hidden;
+  }
+  .detail.open{display:flex;}
+  .detail .head{
+    padding:10px 18px; border-bottom:1px solid var(--line);
+    display:flex; align-items:flex-start; gap:12px;
+  }
+  .detail .head .titles{flex:1; min-width:0;}
+  .detail .head h2{margin:0 0 4px; font-size:14px; font-family:var(--mono);}
+  .detail .head .sub{font-size:11.5px; color:var(--text-dim); font-family:var(--mono);}
+  .detail .head .btnClose{
+    background:var(--bg); border:1px solid var(--line); color:var(--text-dim);
+    width:26px; height:26px; border-radius:6px; cursor:pointer; font-size:13px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .detail .head .btnClose:hover{color:var(--text); border-color:var(--red);}
+  .detail pre{
+    margin:0; padding:16px 18px; overflow:auto; flex:1; font-family:var(--mono); font-size:12px;
+    line-height:1.6; color:var(--mint);
+  }
+  .detail .empty{padding:40px 20px; color:var(--text-dim); font-size:13px; text-align:center;}
+  .k{color:#8fb8ff;}
+  ::-webkit-scrollbar{width:9px; height:9px;}
+  ::-webkit-scrollbar-thumb{background:var(--line); border-radius:5px;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="dot off" id="connDot"></span>
+    <div>
+      <h1>Relais — Console de transactions</h1>
+      <small id="connLabel">connexion…</small>
+    </div>
+  </div>
+  <div class="stats">
+    <span>Total <b id="statTotal">0</b></span>
+    <span>Clients connus <b id="statUsers">0</b></span>
+    <span>Refusés <b id="statRefused">0</b></span>
+  </div>
+</header>
+
+<div class="toolbar">
+  <input type="text" id="filterInput" placeholder="Filtrer par id (from/to)…">
+  <button data-action="" class="active">Tout</button>
+  <button data-action="register,register_ok,register_auth,register_denied,challenge">Register</button>
+  <button data-action="pair_request">Pairing</button>
+  <button data-action="envelope,envelope_refused">Envelope</button>
+  <button data-action="disconnect">Déconnexions</button>
+</div>
+
+<div class="body">
+  <div class="list" id="list">
+    <table>
+      <thead>
+        <tr><th style="width:110px;">Heure</th><th>From → To</th><th style="width:220px;">Action / Type</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="detail" id="detail"></div>
+</div>
+
+<script>
+  const rowsEl = document.getElementById('rows');
+  const detailEl = document.getElementById('detail');
+  const connDot = document.getElementById('connDot');
+  const connLabel = document.getElementById('connLabel');
+  const statTotal = document.getElementById('statTotal');
+  const statUsers = document.getElementById('statUsers');
+  const statRefused = document.getElementById('statRefused');
+  const filterInput = document.getElementById('filterInput');
+
+  let events = [];
+  let actionFilter = '';
+  let textFilter = '';
+  let selectedEvent = null; // référence directe à l'évènement affiché, pas un index (survit à un décalage du tableau)
+  let detailOpen = false;
+  let seenUsers = new Set();
+  let refusedCount = 0;
+
+  document.querySelectorAll('.toolbar button[data-action]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.toolbar button[data-action]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      actionFilter = btn.dataset.action;
+      render();
+    });
+  });
+  filterInput.addEventListener('input', () => { textFilter = filterInput.value.trim().toLowerCase(); render(); });
+
+  function fmtTime(ts) {
+    const d = new Date(ts);
+    return d.toLocaleTimeString('fr-FR', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+  }
+
+  function passesFilter(ev) {
+    if (actionFilter && !actionFilter.split(',').includes(ev.action)) return false;
+    if (textFilter) {
+      const hay = `${ev.from || ''} ${ev.to || ''}`.toLowerCase();
+      if (!hay.includes(textFilter)) return false;
+    }
+    return true;
+  }
+
+  function render() {
+    rowsEl.innerHTML = '';
+    const filtered = events.filter(passesFilter);
+    for (let i = filtered.length - 1; i >= 0; i--) {
+      const ev = filtered[i];
+      const tr = document.createElement('tr');
+      if (detailOpen && ev === selectedEvent) tr.classList.add('selected');
+      const statusTag = ev.status && ev.status !== 'ok'
+        ? `<span class="status-tag ${ev.status}">${ev.status}</span>` : '';
+      tr.innerHTML = `
+        <td class="time">${fmtTime(ev.time)}</td>
+        <td class="who">${ev.from || '—'}${ev.to ? `<span class="arrow">→</span>${ev.to}` : ''}</td>
+        <td><span class="badge ${ev.action}">${ev.action}${ev.type ? ' · ' + ev.type : ''}</span>${statusTag}</td>
+      `;
+      tr.addEventListener('click', () => {
+        // Cliquer sur la ligne déjà ouverte referme le panneau ; cliquer sur
+        // n'importe quelle ligne (la même ou une autre) le rouvre dessus.
+        if (detailOpen && ev === selectedEvent) closeDetail();
+        else { selectedEvent = ev; detailOpen = true; renderDetail(); render(); }
+      });
+      rowsEl.appendChild(tr);
+    }
+    statTotal.textContent = events.length;
+    statUsers.textContent = seenUsers.size;
+    statRefused.textContent = refusedCount;
+  }
+
+  function renderDetail() {
+    if (!detailOpen || !selectedEvent) {
+      detailEl.classList.remove('open');
+      detailEl.innerHTML = '';
+      return;
+    }
+    const ev = selectedEvent;
+    detailEl.classList.add('open');
+    detailEl.innerHTML = `
+      <div class="head">
+        <div class="titles">
+          <h2><span class="badge ${ev.action}">${ev.action}</span></h2>
+          <div class="sub">${fmtTime(ev.time)} — ${ev.from || '—'}${ev.to ? ' → ' + ev.to : ''}${ev.status && ev.status !== 'ok' ? ' — ' + ev.status : ''}</div>
+        </div>
+        <button class="btnClose" title="Fermer">✕</button>
+      </div>
+      <pre>${syntaxHighlight(ev.data)}</pre>
+    `;
+    detailEl.querySelector('.btnClose').addEventListener('click', closeDetail);
+  }
+
+  function closeDetail() {
+    detailOpen = false;
+    selectedEvent = null;
+    renderDetail();
+    render();
+  }
+
+  function syntaxHighlight(obj) {
+    const json = JSON.stringify(obj, null, 2) || '{}';
+    return json.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/(&quot;.*?&quot;)(:)/g, '<span class="k">$1</span>$2')
+      .replace(/"/g, '&quot;');
+  }
+
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}`);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ action: 'admin_subscribe' }));
+      connDot.classList.remove('off');
+      connLabel.textContent = `connecté à ${location.host}`;
+    };
+    ws.onclose = () => {
+      connDot.classList.add('off');
+      connLabel.textContent = 'déconnecté — nouvelle tentative dans 2s';
+      setTimeout(connect, 2000);
+    };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (raw) => {
+      let ev;
+      try { ev = JSON.parse(raw.data); } catch { return; }
+
+      if (ev.action === 'admin_subscribed') return;
+
+      if (ev.action === 'admin_history') {
+        events = ev.events;
+        seenUsers = new Set();
+        refusedCount = 0;
+        for (const e of events) {
+          if (e.from) seenUsers.add(e.from);
+          if (e.to) seenUsers.add(e.to);
+          if (e.status === 'error') refusedCount++;
+        }
+        render();
+        return;
+      }
+
+      events.push(ev);
+      if (events.length > 2000) events.shift();
+      if (ev.from) seenUsers.add(ev.from);
+      if (ev.to) seenUsers.add(ev.to);
+      if (ev.status === 'error') refusedCount++;
+      render();
+    };
+  }
+
+  connect();
+</script>
+</body>
+</html>
