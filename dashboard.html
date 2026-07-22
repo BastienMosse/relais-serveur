@@ -78,6 +78,8 @@
   .badge.envelope{color:var(--amber); border-color:#5a4726;}
   .badge.pair_request{color:#8fb8ff; border-color:#243a5a;}
   .badge.disconnect, .badge.challenge, .badge.register_auth{color:var(--text-dim);}
+  .badge.push_subscribe{color:#8fb8ff; border-color:#243a5a;}
+  .badge.push_sent{color:var(--mint); border-color:var(--mint-dim);}
   .status-tag{font-size:10.5px; color:var(--text-dim); margin-left:6px;}
   .status-tag.queued{color:var(--amber);}
   .status-tag.error{color:var(--red);}
@@ -133,6 +135,7 @@
   <button data-action="register,register_ok,register_auth,register_denied,challenge">Register</button>
   <button data-action="pair_request">Pairing</button>
   <button data-action="envelope,envelope_refused">Envelope</button>
+  <button data-action="push_subscribe,push_sent">Push</button>
   <button data-action="disconnect">Déconnexions</button>
 </div>
 
