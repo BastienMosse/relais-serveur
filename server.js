@@ -258,6 +258,7 @@ function completeRegistration(socket, connState, id, pubkey) {
   log(`REGISTER  ${id} authentifié — clé publique reçue (${pubkey.slice(0, 16)}...)`);
   socket.send(JSON.stringify({ action: 'register_ok', id }));
   broadcastTransaction({ from: id, action: 'register_ok', data: { id, pubkey } });
+  syncLinksOnConnect(id);
   deliverPendingMessages(id, socket);
 }
 
@@ -289,7 +290,7 @@ function addLink(id, peerId) {
   links.get(id).add(peerId);
 }
 
-function notifyPaired(recipientId, peerId) {
+function notifyPaired(recipientId, peerId, opts = {}) {
   const recipient = users.get(recipientId);
   const peer = users.get(peerId);
   if (!recipient) return;
@@ -297,7 +298,26 @@ function notifyPaired(recipientId, peerId) {
     action: 'paired',
     peer: peerId,
     peerPubkey: peer ? peer.pubkey : null,
+    sync: !!opts.sync,
   }));
+}
+
+// À chaque (re)connexion, renvoie l'état de tous les liens déjà persistés
+// pour cet id (table "links"), avec sync:true. Corrige le cas où un lien a
+// été créé pendant que ce client (ou son partenaire) était hors ligne :
+// contrairement aux messages chiffrés (cf. pending/deliverPendingMessages),
+// l'évènement 'paired' d'origine n'était jusqu'ici JAMAIS rejoué — le lien
+// existait bien côté serveur mais le client ne le découvrait jamais, donc le
+// contact n'apparaissait pas. sync:true indique au client qu'il ne s'agit
+// pas d'un nouvel appairage (voir handlePaired côté client.js : pas de reset
+// des compteurs de séquence, pas de changement de contact actif).
+function syncLinksOnConnect(id) {
+  const peers = links.get(id);
+  if (!peers || !peers.size) return;
+  for (const peerId of peers) {
+    notifyPaired(id, peerId, { sync: true });     // fait découvrir/rafraîchir peerId à id
+    notifyPaired(peerId, id, { sync: true });      // rafraîchit aussi l'autre côté si déjà connecté
+  }
 }
 
 function handleEnvelope(msg) {
