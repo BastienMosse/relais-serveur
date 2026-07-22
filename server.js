@@ -4,11 +4,26 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 
+// Charge un éventuel fichier .env local (test en local uniquement — sur
+// Render, .env n'existe pas sur le serveur déployé et n'a aucun effet : les
+// variables doivent être ajoutées dans l'onglet Environment du dashboard
+// Render). Nécessite `npm install` (voir package.json, dotenv y est listé).
+require('dotenv').config();
+
 // Render (et la plupart des PaaS gratuits) imposent leur propre port via
 // process.env.PORT : il faut s'y brancher, 8080 ne sert que pour un test local.
 const PORT = process.env.PORT || 8080;
 const STATE_FILE = './data/server_state.json';
 const DASHBOARD_FILE = path.join(__dirname, 'dashboard.html');
+
+// Identifiant + jeton pour protéger le dashboard de monitoring (sinon
+// accessible par quiconque connaît l'URL Render). Définis via variables
+// d'env, jamais codés en dur. Sans ADMIN_TOKEN défini, le dashboard reste
+// désactivé (401 systématique) plutôt que de rester ouvert par défaut : un
+// oubli de config ne doit jamais se traduire par un accès public.
+// ADMIN_USER est optionnel : s'il n'est pas défini, "admin" est utilisé.
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
 
 const LOG_FILE = './data/transactions.log';
 const MAX_HISTORY = 2000;
@@ -330,6 +345,16 @@ function handleDisconnect(id) {
 function dispatch(socket, connState, msg) {
   switch (msg.action) {
     case 'admin_subscribe': {
+      // Le token est revérifié ici même si la page a déjà passé le Basic
+      // Auth HTTP : n'importe qui connaissant l'URL du relais peut ouvrir une
+      // connexion WebSocket brute et tenter 'admin_subscribe' sans jamais
+      // charger dashboard.html — cette étape est donc la véritable barrière,
+      // le Basic Auth sur la page n'est qu'un confort pour l'usage normal.
+      if (!ADMIN_TOKEN || msg.token !== ADMIN_TOKEN) {
+        socket.send(JSON.stringify({ action: 'admin_denied' }));
+        log('ALERTE    tentative admin_subscribe refusée (token invalide ou absent)');
+        return;
+      }
       socket.send(JSON.stringify({ action: 'admin_subscribed' }));
       connState.isAdmin = true;
       loadTransactionHistory().then((history) => {
@@ -356,6 +381,33 @@ function dispatch(socket, connState, msg) {
   }
 }
 
+// Vérifie l'en-tête HTTP Basic Auth : identifiant (ADMIN_USER, "admin" par
+// défaut) ET mot de passe (ADMIN_TOKEN) doivent correspondre. Comparaison en
+// temps constant pour éviter qu'un attaquant ne devine les valeurs octet par
+// octet via le temps de réponse. Renvoie false si ADMIN_TOKEN n'est pas
+// configuré : par défaut, personne n'entre.
+function safeEqual(a, b) {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  // timingSafeEqual exige deux buffers de même longueur ; on les égalise
+  // avec un hash au préalable plutôt que de comparer les longueurs en clair
+  // (qui fuirait déjà un peu d'info via un court-circuit).
+  const hashA = crypto.createHash('sha256').update(bufA).digest();
+  const hashB = crypto.createHash('sha256').update(bufB).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+function isAuthorized(req) {
+  if (!ADMIN_TOKEN) return false;
+  const header = req.headers['authorization'] || '';
+  if (!header.startsWith('Basic ')) return false;
+  const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+  const sepIndex = decoded.indexOf(':');
+  const user = sepIndex === -1 ? decoded : decoded.slice(0, sepIndex);
+  const password = sepIndex === -1 ? '' : decoded.slice(sepIndex + 1);
+  return safeEqual(user, ADMIN_USER) && safeEqual(password, ADMIN_TOKEN);
+}
+
 function parseMessage(raw) {
   try {
     return JSON.parse(raw.toString());
@@ -371,10 +423,21 @@ function startServer() {
   // les mêmes connexions WebSocket (clients ET dashboard) sur le même port.
   const httpServer = http.createServer((req, res) => {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/dashboard')) {
-      fs.readFile(DASHBOARD_FILE, (err, html) => {
+      if (!isAuthorized(req)) {
+        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Relais monitoring"' });
+        res.end('Authentification requise.');
+        return;
+      }
+      fs.readFile(DASHBOARD_FILE, 'utf8', (err, html) => {
         if (err) { res.writeHead(500); res.end('dashboard.html introuvable'); return; }
+        // Le token est injecté ici, après authentification réussie, pour que
+        // le JS du dashboard puisse l'inclure dans son 'admin_subscribe' —
+        // c'est ce même token que le serveur revalide côté WebSocket (voir
+        // dispatch/admin_subscribe) : la page HTML seule ne suffit pas à
+        // accéder au flux, il faut aussi le bon token au niveau WS.
+        const withToken = html.replace('__ADMIN_TOKEN__', JSON.stringify(ADMIN_TOKEN || ''));
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(html);
+        res.end(withToken);
       });
       return;
     }
@@ -401,6 +464,12 @@ function startServer() {
 
   httpServer.listen(PORT, () => {
     log(`Serveur démarré (port ${PORT}, stockage: ${USE_REDIS ? 'Upstash Redis' : 'disque local'})`);
+    // Ne jamais logger la VALEUR du token — juste sa présence, pour pouvoir
+    // diagnostiquer en un coup d'oeil dans les logs Render un ADMIN_TOKEN
+    // oublié dans un .env local au lieu de l'onglet Environment du service.
+    log(ADMIN_TOKEN
+      ? `DASHBOARD ADMIN_TOKEN détecté — dashboard accessible sur /dashboard (identifiant: ${ADMIN_USER})`
+      : 'DASHBOARD ADMIN_TOKEN absent — dashboard désactivé (401). Ajoutez-le dans l\'onglet Environment de Render.');
   });
   loadState();
 }

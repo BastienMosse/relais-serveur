@@ -252,12 +252,17 @@
       .replace(/"/g, '&quot;');
   }
 
+  // Injecté côté serveur au moment où la page est servie (après vérification
+  // du Basic Auth) — jamais codé en dur ici, jamais présent tant que
+  // l'authentification n'a pas réussi.
+  const ADMIN_TOKEN = __ADMIN_TOKEN__;
+
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}`);
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ action: 'admin_subscribe' }));
+      ws.send(JSON.stringify({ action: 'admin_subscribe', token: ADMIN_TOKEN }));
       connDot.classList.remove('off');
       connLabel.textContent = `connecté à ${location.host}`;
     };
@@ -272,6 +277,11 @@
       try { ev = JSON.parse(raw.data); } catch { return; }
 
       if (ev.action === 'admin_subscribed') return;
+      if (ev.action === 'admin_denied') {
+        connLabel.textContent = 'accès refusé (token invalide) — vérifiez ADMIN_TOKEN côté serveur';
+        ws.close();
+        return;
+      }
 
       if (ev.action === 'admin_history') {
         events = ev.events;
