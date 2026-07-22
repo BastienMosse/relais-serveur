@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
-const webpush = require('web-push');
+const webPush = require('web-push');
 
 // Charge un éventuel fichier .env local (test en local uniquement — sur
 // Render, .env n'existe pas sur le serveur déployé et n'a aucun effet : les
@@ -25,18 +25,9 @@ const DASHBOARD_FILE = path.join(__dirname, 'dashboard.html');
 // ADMIN_USER est optionnel : s'il n'est pas défini, "admin" est utilisé.
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
-
-// Notifications push (Web Push) : permet de prévenir un client fermé/en
-// arrière-plan qu'un message l'attend, sans jamais transmettre le contenu en
-// clair dans le push (voir notifyOffline plus bas). Comme pour ADMIN_TOKEN,
-// absent des variables d'env => désactivé plutôt que planter le serveur.
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || null;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || null;
-const VAPID_CONTACT = process.env.VAPID_CONTACT || 'mailto:admin@example.com';
-const VAPID_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
-if (VAPID_ENABLED) {
-  webpush.setVapidDetails(VAPID_CONTACT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-}
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
 
 const LOG_FILE = './data/transactions.log';
 const MAX_HISTORY = 2000;
@@ -65,13 +56,20 @@ const REDIS_LOG_KEY = 'relais:log';
 
 if (!USE_REDIS && !fs.existsSync('./data')) fs.mkdirSync('./data', { recursive: true });
 
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webPush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+  log('PUSH      VAPID configuré — notifications Web Push activées');
+} else {
+  log('PUSH      VAPID non configuré — notifications Web Push désactivées. Définissez VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY et VAPID_SUBJECT.');
+}
+
 // --- "Base de données" en mémoire (juste pour le test) ---
 const users = new Map();       // id -> { pubkey, socket }         (connectés actuellement, jamais persisté)
 const identities = new Map();  // id -> { signPubkey }             (épinglé au 1er contact — PERSISTÉ sur disque)
 const challenges = new Map();  // socket -> { id, pubkey, nonce, expected }
 const links = new Map();       // id -> Set<id des contacts liés>  (PERSISTÉ sur disque, cf. addLink/isLinked)
 const pending = new Map();     // id -> [enveloppes en attente si hors ligne]  (PERSISTÉ sur disque)
-const pushSubscriptions = new Map(); // id -> PushSubscription Web Push       (PERSISTÉ sur disque)
+const pushSubscriptions = new Map(); // id -> [subscription objects] (persisté dans l'état)
 
 // --- Observabilité (dashboard) ---
 // Sockets admin abonnées au flux de transactions (pas persisté, juste pour observer en direct).
@@ -161,7 +159,7 @@ async function loadState() {
     links.set(id, new Set(peerIds));
   }
   for (const [id, queue] of Object.entries(data.pending || {})) pending.set(id, queue);
-  for (const [id, sub] of Object.entries(data.pushSubscriptions || {})) pushSubscriptions.set(id, sub);
+  for (const [id, subs] of Object.entries(data.pushSubscriptions || {})) pushSubscriptions.set(id, Array.isArray(subs) ? subs : []);
   const pendingCount = [...pending.values()].reduce((sum, q) => sum + q.length, 0);
   const linkCount = [...links.values()].reduce((sum, set) => sum + set.size, 0) / 2;
   log(`ETAT      chargé depuis ${STATE_FILE} (${identities.size} identité(s), ${linkCount} lien(s), ${pendingCount} message(s) en attente)`);
@@ -172,7 +170,7 @@ async function saveState() {
     identities: Object.fromEntries(identities),
     links: Object.fromEntries([...links].map(([id, set]) => [id, [...set]])),
     pending: Object.fromEntries(pending),
-    pushSubscriptions: Object.fromEntries(pushSubscriptions),
+    pushSubscriptions: Object.fromEntries([...pushSubscriptions].map(([id, subs]) => [id, subs])),
   });
   if (USE_REDIS) {
     try {
@@ -272,48 +270,6 @@ function deliverPendingMessages(id, socket) {
   saveState();
 }
 
-function registerPushSubscription(id, subscription) {
-  if (!id || !subscription || !subscription.endpoint) return;
-  pushSubscriptions.set(id, subscription);
-  saveState();
-  log(`PUSH      abonnement enregistré pour ${id}`);
-}
-
-// Notifie un client hors ligne qu'un message l'attend. Le contenu du push
-// reste volontairement générique : ni texte, ni nom en clair, seulement
-// l'id de l'expéditeur (déjà connu du destinataire puisqu'ils sont liés) —
-// le chiffrement de bout en bout se fait entre clients, le transport push
-// n'a pas à en connaître le contenu.
-async function notifyOffline(recipientId, fromId) {
-  if (!VAPID_ENABLED) return;
-  const sub = pushSubscriptions.get(recipientId);
-  if (!sub) return;
-
-  const payload = JSON.stringify({
-    title: 'Relais',
-    body: 'Vous avez reçu un nouveau message.',
-    tag: fromId ? `relais-${fromId}` : 'relais-message',
-    contactId: fromId || null,
-  });
-
-  try {
-    await webpush.sendNotification(sub, payload);
-    broadcastTransaction({ from: fromId, to: recipientId, action: 'push_sent', data: { via: 'webpush' } });
-  } catch (err) {
-    if (err.statusCode === 404 || err.statusCode === 410) {
-      // Abonnement expiré ou révoqué côté navigateur : on l'oublie, le client
-      // s'en recréera un à sa prochaine connexion (voir setupPushSubscription
-      // côté app.js, qui redemande un abonnement à chaque register_ok).
-      pushSubscriptions.delete(recipientId);
-      saveState();
-      log(`PUSH      abonnement expiré supprimé pour ${recipientId}`);
-    } else {
-      log(`PUSH      échec d'envoi pour ${recipientId} : ${err.statusCode || err.message}`);
-      broadcastTransaction({ from: fromId, to: recipientId, action: 'push_sent', status: 'error', data: { reason: err.message } });
-    }
-  }
-}
-
 function handlePairRequest(msg) {
   // msg: { from, to, pubkey } — "to" a été lu depuis le QR affiché par l'autre.
   // addLink AJOUTE (n'écrase pas) : un id peut être lié à plusieurs contacts,
@@ -381,11 +337,6 @@ function routeEnvelope(msg) {
     return;
   }
   queuePendingEnvelope(msg);
-  // On ne notifie que pour un vrai message (kind absent ou 'data') : pas pour
-  // un accusé de réception/lecture ni une annonce de nom, qui ne justifient
-  // pas de réveiller l'utilisateur avec une notification.
-  const kind = msg.kind || 'data';
-  if (kind === 'data') notifyOffline(msg.to, msg.from);
 }
 
 function queuePendingEnvelope(msg) {
@@ -394,6 +345,44 @@ function queuePendingEnvelope(msg) {
   pending.set(msg.to, q);
   saveState();
   log(`ATTENTE   ${msg.to} hors ligne, message mis en file d'attente`);
+  void sendPushNotification(msg.to, 'Nouveau message', `Vous avez reçu un message de ${msg.from}`, { contactId: msg.from });
+}
+
+function handlePushSubscribe(socket, connState, msg) {
+  if (!msg.id || !msg.subscription) return;
+  const existing = pushSubscriptions.get(msg.id) || [];
+  const subscription = msg.subscription;
+  const endpoint = subscription && subscription.endpoint;
+  if (!endpoint) return;
+  const alreadyPresent = existing.some((item) => item && item.endpoint === endpoint);
+  if (!alreadyPresent) {
+    existing.push(subscription);
+    pushSubscriptions.set(msg.id, existing);
+    saveState();
+  }
+  socket.send(JSON.stringify({ action: 'push_subscribed' }));
+  log(`PUSH      abonnement enregistré pour ${msg.id}`);
+}
+
+async function sendPushNotification(recipientId, title, body, data = {}) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  const subscriptions = pushSubscriptions.get(recipientId) || [];
+  if (!subscriptions.length) return;
+  const payload = JSON.stringify({ title, body, tag: 'relais-message', data });
+  const results = await Promise.allSettled(subscriptions.map((sub) => webPush.sendNotification(sub, payload)));
+  for (const [index, result] of results.entries()) {
+    if (result.status === 'rejected') {
+      const err = result.reason;
+      if (err && (err.statusCode === 404 || err.statusCode === 410)) {
+        const current = pushSubscriptions.get(recipientId) || [];
+        const filtered = current.filter((sub) => sub && sub.endpoint !== subscriptions[index].endpoint);
+        if (filtered.length !== current.length) {
+          pushSubscriptions.set(recipientId, filtered);
+          saveState();
+        }
+      }
+    }
+  }
 }
 
 function handleDisconnect(id) {
@@ -436,25 +425,12 @@ function dispatch(socket, connState, msg) {
     case 'pair_request':
       handlePairRequest(msg);
       break;
+    case 'push_subscribe':
+      handlePushSubscribe(socket, connState, msg);
+      break;
     case 'envelope':
       handleEnvelope(msg);
       break;
-    case 'push_subscribe': {
-      // On ignore volontairement tout msg.id fourni par le client : seul
-      // l'id déjà authentifié sur CETTE connexion (via register/register_auth)
-      // fait foi, sinon n'importe qui pourrait s'abonner aux notifications
-      // d'un autre id sans jamais prouver qu'il le possède.
-      if (!connState.myId) {
-        log('ALERTE    push_subscribe reçu avant tout register_ok, ignoré');
-        return;
-      }
-      registerPushSubscription(connState.myId, msg.subscription);
-      broadcastTransaction({
-        from: connState.myId, action: 'push_subscribe',
-        data: { endpoint: msg.subscription && msg.subscription.endpoint },
-      });
-      break;
-    }
     default:
       log(`INCONNU   action non reconnue: ${msg.action}`);
   }
@@ -549,9 +525,6 @@ function startServer() {
     log(ADMIN_TOKEN
       ? `DASHBOARD ADMIN_TOKEN détecté — dashboard accessible sur /dashboard (identifiant: ${ADMIN_USER})`
       : 'DASHBOARD ADMIN_TOKEN absent — dashboard désactivé (401). Ajoutez-le dans l\'onglet Environment de Render.');
-    log(VAPID_ENABLED
-      ? 'PUSH      VAPID détecté — notifications push activées'
-      : 'PUSH      VAPID absent — notifications push désactivées (ajoutez VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY dans Environment).');
   });
   loadState();
 }
