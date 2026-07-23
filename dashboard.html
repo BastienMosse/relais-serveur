@@ -76,6 +76,7 @@
   .badge.register, .badge.register_ok{color:var(--mint); border-color:var(--mint-dim);}
   .badge.register_denied, .badge.envelope_refused{color:var(--red); border-color:#4a2724;}
   .badge.envelope{color:var(--amber); border-color:#5a4726;}
+  .badge.envelope_delivered_late{color:var(--mint); border-color:var(--mint-dim);}
   .badge.pair_request{color:#8fb8ff; border-color:#243a5a;}
   .badge.disconnect, .badge.challenge, .badge.register_auth{color:var(--text-dim);}
   .badge.push_subscribe{color:#8fb8ff; border-color:#243a5a;}
@@ -134,7 +135,7 @@
   <button data-action="" class="active">Tout</button>
   <button data-action="register,register_ok,register_auth,register_denied,challenge">Register</button>
   <button data-action="pair_request">Pairing</button>
-  <button data-action="envelope,envelope_refused">Envelope</button>
+  <button data-action="envelope,envelope_refused,envelope_delivered_late">Envelope</button>
   <button data-action="push_subscribe,push_sent">Push</button>
   <button data-action="disconnect">Déconnexions</button>
 </div>

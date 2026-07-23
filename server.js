@@ -240,7 +240,17 @@ function deliverPendingMessages(id, socket) {
   const queue = pending.get(id) || [];
   if (!queue.length) return;
   log(`LIVRAISON ${queue.length} message(s) en attente livrés à ${id}`);
-  for (const env of queue) socket.send(JSON.stringify(env));
+  for (const env of queue) {
+    socket.send(JSON.stringify(env));
+    // Trace distincte de l'envoi initial (qui a été marqué "queued" dans le
+    // dashboard) : sans ça, on ne peut pas voir dans la console si un message
+    // "queued" a fini par arriver à destination ou s'il est resté coincé.
+    broadcastTransaction({
+      from: env.from, to: env.to, action: 'envelope_delivered_late',
+      type: env.kind && env.kind !== 'data' ? env.kind : (env.type || 'data'),
+      status: 'ok', data: env,
+    });
+  }
   pending.delete(id);
   saveState();
 }
@@ -352,8 +362,16 @@ function queuePendingEnvelope(msg) {
 }
 
 
-function handleDisconnect(id) {
+function handleDisconnect(id, socket) {
   if (!id) return;
+  const current = users.get(id);
+  // Un évènement 'close' peut arriver en retard sur une ANCIENNE socket,
+  // après qu'une reconnexion plus récente (ex. déclenchée par le heartbeat)
+  // ait déjà repris la place dans "users". Sans cette vérification, cette
+  // fermeture tardive efface la connexion active actuelle et l'utilisateur
+  // reste invisible pour routeEnvelope (tout part en pending) alors même
+  // qu'il est bien connecté.
+  if (current && current.socket !== socket) return;
   users.delete(id);
   log(`DECONNEX  ${id}`);
   broadcastTransaction({ from: id, action: 'disconnect', data: { id } });
@@ -494,7 +512,7 @@ function startServer() {
     socket.on('close', () => {
       challenges.delete(socket);
       adminSockets.delete(socket);
-      handleDisconnect(connState.myId);
+      handleDisconnect(connState.myId, socket);
     });
   });
 
