@@ -313,7 +313,8 @@ function handleEnvelope(msg) {
   log(`ROUTAGE   ${msg.from} -> ${msg.to}  ${label} seq=${msg.seq}  ` +
       `payload chiffré (${msg.ciphertext.length} car. base64, illisible ici)`);
 
-  const delivered = users.has(msg.to);
+  const targetUser = users.get(msg.to);
+  const delivered = !!targetUser && targetUser.socket.readyState === WebSocket.OPEN;
   routeEnvelope(msg);
   broadcastTransaction({
     from: msg.from, to: msg.to, action: 'envelope', type: effectiveType,
@@ -327,8 +328,16 @@ function isLinked(fromId, toId) {
 
 function routeEnvelope(msg) {
   const target = users.get(msg.to);
-  if (target) {
-    target.socket.send(JSON.stringify(msg));
+  // users.has(id) veut seulement dire "pas encore vu de 'close' sur sa
+  // socket" — ça reste vrai un bon moment sur une connexion zombie (coupure
+  // réseau silencieuse, veille mobile...). On vérifie donc aussi readyState,
+  // et si l'envoi échoue quand même (socket qui se croyait ouverte mais dont
+  // l'écriture échoue), on retombe sur la file d'attente au lieu de perdre
+  // le message : il sera livré au prochain vrai reconnect (deliverPendingMessages).
+  if (target && target.socket.readyState === WebSocket.OPEN) {
+    target.socket.send(JSON.stringify(msg), (err) => {
+      if (err) queuePendingEnvelope(msg);
+    });
     return;
   }
   queuePendingEnvelope(msg);
@@ -354,6 +363,16 @@ function handleDisconnect(id) {
 
 function dispatch(socket, connState, msg) {
   switch (msg.action) {
+    case 'ping':
+      // Heartbeat applicatif : le client (page JS) ne peut pas observer les
+      // trames ping/pong bas niveau du protocole WebSocket (le navigateur les
+      // gère seul, en dehors du JS). On lui donne donc un pong explicite au
+      // niveau JSON, qu'il peut surveiller pour détecter une connexion morte
+      // et forcer sa propre reconnexion. Pas de log/broadcastTransaction ici :
+      // ça tournerait toutes les ~20s pour chaque client connecté et
+      // noierait le dashboard sous du bruit sans intérêt.
+      socket.send(JSON.stringify({ action: 'pong' }));
+      break;
     case 'admin_subscribe': {
       // Le token est revérifié ici même si la page a déjà passé le Basic
       // Auth HTTP : n'importe qui connaissant l'URL du relais peut ouvrir une
@@ -460,6 +479,13 @@ function startServer() {
   wss.on('connection', (socket) => {
     const connState = { myId: null, isAdmin: false };
 
+    // Heartbeat bas niveau (trames ping/pong du protocole WebSocket, gérées
+    // automatiquement par le navigateur côté client, sans JS). On marque la
+    // socket "vivante" à chaque pong reçu ; le setInterval ci-dessous
+    // termine celles qui n'ont pas répondu depuis le dernier tour.
+    socket.isAlive = true;
+    socket.on('pong', () => { socket.isAlive = true; });
+
     socket.on('message', (raw) => {
       const msg = parseMessage(raw);
       if (msg) dispatch(socket, connState, msg);
@@ -471,6 +497,24 @@ function startServer() {
       handleDisconnect(connState.myId);
     });
   });
+
+  // Toutes les 30s : termine toute socket qui n'a pas répondu au ping
+  // précédent (connexion zombie — coupure réseau silencieuse, veille mobile,
+  // proxy Render qui a coupé sans trame close...). terminate() déclenche
+  // 'close' normalement, ce qui nettoie users/adminSockets et remet les
+  // messages en attente pour le prochain vrai reconnect au lieu de les
+  // envoyer dans le vide (cf. routeEnvelope).
+  const heartbeat = setInterval(() => {
+    for (const socket of wss.clients) {
+      if (socket.isAlive === false) {
+        socket.terminate();
+        continue;
+      }
+      socket.isAlive = false;
+      socket.ping();
+    }
+  }, 30000);
+  wss.on('close', () => clearInterval(heartbeat));
 
   httpServer.listen(PORT, () => {
     log(`Serveur démarré (port ${PORT}, stockage: ${USE_REDIS ? 'Upstash Redis' : 'disque local'})`);
