@@ -175,18 +175,12 @@ function handleRegister(socket, connState, msg) {
 
   const known = identities.get(id);
   if (!known) {
-    // Personne n'a jamais utilisé cet id : on épingle sa clé d'identité, comme un
-    // safety number qu'on accepte "à la confiance" au tout premier contact (TOFU).
     identities.set(id, { signPubkey });
     saveState();
     completeRegistration(socket, connState, id, pubkey);
     return;
   }
 
-  // L'id existe déjà : on exige la preuve de possession de la clé d'identité
-  // ENREGISTRÉE À L'ORIGINE (pas celle que le nouveau venu propose). C'est ce qui
-  // empêche D de prendre la place de A rien qu'en se connectant avec id="A" :
-  // D n'a pas la clé privée correspondant à la clé déjà épinglée pour "A".
   const nonce = crypto.randomBytes(32).toString('base64');
   challenges.set(socket, { id, pubkey, nonce, expected: known.signPubkey });
   socket.send(JSON.stringify({ action: 'challenge', nonce }));
@@ -242,9 +236,6 @@ function deliverPendingMessages(id, socket) {
   log(`LIVRAISON ${queue.length} message(s) en attente livrés à ${id}`);
   for (const env of queue) {
     socket.send(JSON.stringify(env));
-    // Trace distincte de l'envoi initial (qui a été marqué "queued" dans le
-    // dashboard) : sans ça, on ne peut pas voir dans la console si un message
-    // "queued" a fini par arriver à destination ou s'il est resté coincé.
     broadcastTransaction({
       from: env.from, to: env.to, action: 'envelope_delivered_late',
       type: env.kind && env.kind !== 'data' ? env.kind : (env.type || 'data'),
@@ -256,9 +247,6 @@ function deliverPendingMessages(id, socket) {
 }
 
 function handlePairRequest(msg) {
-  // msg: { from, to, pubkey } — "to" a été lu depuis le QR affiché par l'autre.
-  // addLink AJOUTE (n'écrase pas) : un id peut être lié à plusieurs contacts,
-  // ce qui permet le panel "plusieurs contacts" côté client.
   addLink(msg.from, msg.to);
   addLink(msg.to, msg.from);
   saveState();
@@ -287,15 +275,6 @@ function notifyPaired(recipientId, peerId, opts = {}) {
   log(`LIEN pair - ${recipientId} -> ${peerId}`);
 }
 
-// À chaque (re)connexion, renvoie l'état de tous les liens déjà persistés
-// pour cet id (table "links"), avec sync:true. Corrige le cas où un lien a
-// été créé pendant que ce client (ou son partenaire) était hors ligne :
-// contrairement aux messages chiffrés (cf. pending/deliverPendingMessages),
-// l'évènement 'paired' d'origine n'était jusqu'ici JAMAIS rejoué — le lien
-// existait bien côté serveur mais le client ne le découvrait jamais, donc le
-// contact n'apparaissait pas. sync:true indique au client qu'il ne s'agit
-// pas d'un nouvel appairage (voir handlePaired côté client.js : pas de reset
-// des compteurs de séquence, pas de changement de contact actif).
 function syncLinksOnConnect(id) {
   const peers = links.get(id);
   if (!peers || !peers.size) return;
@@ -306,9 +285,6 @@ function syncLinksOnConnect(id) {
 }
 
 function handleEnvelope(msg) {
-  // msg: { kind, type, from, to, seq, refSeq?, iv, ciphertext } — payload déjà chiffré côté client.
-  // Le serveur route sur from/to uniquement : il n'a pas besoin de connaître le "kind"
-  // (donnée vs accusé de réception/lecture) ni le "type" pour faire son travail.
   const effectiveType = msg.kind && msg.kind !== 'data' ? msg.kind : (msg.type || 'data');
 
   if (!isLinked(msg.from, msg.to)) {
@@ -338,13 +314,7 @@ function isLinked(fromId, toId) {
 
 function routeEnvelope(msg) {
   const target = users.get(msg.to);
-  // users.has(id) veut seulement dire "pas encore vu de 'close' sur sa
-  // socket" — ça reste vrai un bon moment sur une connexion zombie (coupure
-  // réseau silencieuse, veille mobile...). On vérifie donc aussi readyState,
-  // et si l'envoi échoue quand même (socket qui se croyait ouverte mais dont
-  // l'écriture échoue), on retombe sur la file d'attente au lieu de perdre
-  // le message : il sera livré au prochain vrai reconnect (deliverPendingMessages).
-  if (target && target.socket.readyState === WebSocket.OPEN) {
+  if (target && target.socket.readyState === WebSocket.OPEN && target.socket.isAlive !== false) {
     target.socket.send(JSON.stringify(msg), (err) => {
       if (err) queuePendingEnvelope(msg);
     });
@@ -365,12 +335,6 @@ function queuePendingEnvelope(msg) {
 function handleDisconnect(id, socket) {
   if (!id) return;
   const current = users.get(id);
-  // Un évènement 'close' peut arriver en retard sur une ANCIENNE socket,
-  // après qu'une reconnexion plus récente (ex. déclenchée par le heartbeat)
-  // ait déjà repris la place dans "users". Sans cette vérification, cette
-  // fermeture tardive efface la connexion active actuelle et l'utilisateur
-  // reste invisible pour routeEnvelope (tout part en pending) alors même
-  // qu'il est bien connecté.
   if (current && current.socket !== socket) return;
   users.delete(id);
   log(`DECONNEX  ${id}`);
@@ -382,21 +346,9 @@ function handleDisconnect(id, socket) {
 function dispatch(socket, connState, msg) {
   switch (msg.action) {
     case 'ping':
-      // Heartbeat applicatif : le client (page JS) ne peut pas observer les
-      // trames ping/pong bas niveau du protocole WebSocket (le navigateur les
-      // gère seul, en dehors du JS). On lui donne donc un pong explicite au
-      // niveau JSON, qu'il peut surveiller pour détecter une connexion morte
-      // et forcer sa propre reconnexion. Pas de log/broadcastTransaction ici :
-      // ça tournerait toutes les ~20s pour chaque client connecté et
-      // noierait le dashboard sous du bruit sans intérêt.
       socket.send(JSON.stringify({ action: 'pong' }));
       break;
     case 'admin_subscribe': {
-      // Le token est revérifié ici même si la page a déjà passé le Basic
-      // Auth HTTP : n'importe qui connaissant l'URL du relais peut ouvrir une
-      // connexion WebSocket brute et tenter 'admin_subscribe' sans jamais
-      // charger dashboard.html — cette étape est donc la véritable barrière,
-      // le Basic Auth sur la page n'est qu'un confort pour l'usage normal.
       if (!ADMIN_TOKEN || msg.token !== ADMIN_TOKEN) {
         socket.send(JSON.stringify({ action: 'admin_denied' }));
         log('ALERTE    tentative admin_subscribe refusée (token invalide ou absent)');
@@ -428,17 +380,9 @@ function dispatch(socket, connState, msg) {
   }
 }
 
-// Vérifie l'en-tête HTTP Basic Auth : identifiant (ADMIN_USER, "admin" par
-// défaut) ET mot de passe (ADMIN_TOKEN) doivent correspondre. Comparaison en
-// temps constant pour éviter qu'un attaquant ne devine les valeurs octet par
-// octet via le temps de réponse. Renvoie false si ADMIN_TOKEN n'est pas
-// configuré : par défaut, personne n'entre.
 function safeEqual(a, b) {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
-  // timingSafeEqual exige deux buffers de même longueur ; on les égalise
-  // avec un hash au préalable plutôt que de comparer les longueurs en clair
-  // (qui fuirait déjà un peu d'info via un court-circuit).
   const hashA = crypto.createHash('sha256').update(bufA).digest();
   const hashB = crypto.createHash('sha256').update(bufB).digest();
   return crypto.timingSafeEqual(hashA, hashB);
@@ -466,8 +410,6 @@ function parseMessage(raw) {
 // --- Serveur ---
 
 function startServer() {
-  // Un seul serveur HTTP pour tout : sert le dashboard en GET / et accueille
-  // les mêmes connexions WebSocket (clients ET dashboard) sur le même port.
   const httpServer = http.createServer((req, res) => {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/dashboard')) {
       if (!isAuthorized(req)) {
@@ -477,11 +419,6 @@ function startServer() {
       }
       fs.readFile(DASHBOARD_FILE, 'utf8', (err, html) => {
         if (err) { res.writeHead(500); res.end('dashboard.html introuvable'); return; }
-        // Le token est injecté ici, après authentification réussie, pour que
-        // le JS du dashboard puisse l'inclure dans son 'admin_subscribe' —
-        // c'est ce même token que le serveur revalide côté WebSocket (voir
-        // dispatch/admin_subscribe) : la page HTML seule ne suffit pas à
-        // accéder au flux, il faut aussi le bon token au niveau WS.
         const withToken = html.replace('__ADMIN_TOKEN__', JSON.stringify(ADMIN_TOKEN || ''));
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(withToken);
@@ -497,12 +434,12 @@ function startServer() {
   wss.on('connection', (socket) => {
     const connState = { myId: null, isAdmin: false };
 
-    // Heartbeat bas niveau (trames ping/pong du protocole WebSocket, gérées
-    // automatiquement par le navigateur côté client, sans JS). On marque la
-    // socket "vivante" à chaque pong reçu ; le setInterval ci-dessous
-    // termine celles qui n'ont pas répondu depuis le dernier tour.
     socket.isAlive = true;
-    socket.on('pong', () => { socket.isAlive = true; });
+    socket.on('pong', () => {
+      const wasSuspectedZombie = socket.isAlive === false;
+      socket.isAlive = true;
+      if (wasSuspectedZombie && connState.myId) deliverPendingMessages(connState.myId, socket);
+    });
 
     socket.on('message', (raw) => {
       const msg = parseMessage(raw);
@@ -516,12 +453,6 @@ function startServer() {
     });
   });
 
-  // Toutes les 30s : termine toute socket qui n'a pas répondu au ping
-  // précédent (connexion zombie — coupure réseau silencieuse, veille mobile,
-  // proxy Render qui a coupé sans trame close...). terminate() déclenche
-  // 'close' normalement, ce qui nettoie users/adminSockets et remet les
-  // messages en attente pour le prochain vrai reconnect au lieu de les
-  // envoyer dans le vide (cf. routeEnvelope).
   const heartbeat = setInterval(() => {
     for (const socket of wss.clients) {
       if (socket.isAlive === false) {
@@ -536,9 +467,6 @@ function startServer() {
 
   httpServer.listen(PORT, () => {
     log(`Serveur démarré (port ${PORT}, stockage: ${USE_REDIS ? 'Upstash Redis' : 'disque local'})`);
-    // Ne jamais logger la VALEUR du token — juste sa présence, pour pouvoir
-    // diagnostiquer en un coup d'oeil dans les logs Render un ADMIN_TOKEN
-    // oublié dans un .env local au lieu de l'onglet Environment du service.
     log(ADMIN_TOKEN
       ? `DASHBOARD ADMIN_TOKEN détecté — dashboard accessible sur /dashboard (identifiant: ${ADMIN_USER})`
       : 'DASHBOARD ADMIN_TOKEN absent — dashboard désactivé (401). Ajoutez-le dans l\'onglet Environment de Render.');
