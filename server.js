@@ -16,6 +16,8 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
 const LOG_FILE = './data/transactions.log';
 const MAX_HISTORY = 2000;
 
+const RETRY_INTERVAL_MS = 5000;
+
 // ─────────────────────────────────────────────────────────────
 // Persistance : disque local par défaut (pratique en local), mais un plan
 // gratuit type Render a un système de fichiers ÉPHÉMÈRE — tout ce qui est
@@ -134,7 +136,12 @@ async function loadState() {
     const peerIds = Array.isArray(val) ? val : [val];
     links.set(id, new Set(peerIds));
   }
-  for (const [id, queue] of Object.entries(data.pending || {})) pending.set(id, queue);
+  for (const [id, queue] of Object.entries(data.pending || {})) {
+    const normalized = (queue || []).map((item) =>
+      item && item.msg ? { msg: item.msg, sentAt: item.sentAt || 0 } : { msg: item, sentAt: 0 }
+    );
+    pending.set(id, normalized);
+  }
   const pendingCount = [...pending.values()].reduce((sum, q) => sum + q.length, 0);
   const linkCount = [...links.values()].reduce((sum, set) => sum + set.size, 0) / 2;
   log(`ETAT      chargé depuis ${STATE_FILE} (${identities.size} identité(s), ${linkCount} lien(s), ${pendingCount} message(s) en attente)`);
@@ -144,7 +151,7 @@ async function saveState() {
   const payload = JSON.stringify({
     identities: Object.fromEntries(identities),
     links: Object.fromEntries([...links].map(([id, set]) => [id, [...set]])),
-    pending: Object.fromEntries(pending),
+    pending: Object.fromEntries([...pending].map(([id, q]) => [id, q.map((e) => ({ msg: e.msg, sentAt: e.sentAt }))])),
   });
   if (USE_REDIS) {
     try {
@@ -227,23 +234,7 @@ function completeRegistration(socket, connState, id, pubkey) {
   socket.send(JSON.stringify({ action: 'register_ok', id }));
   broadcastTransaction({ from: id, action: 'register_ok', data: { id, pubkey } });
   syncLinksOnConnect(id);
-  deliverPendingMessages(id, socket);
-}
-
-function deliverPendingMessages(id, socket) {
-  const queue = pending.get(id) || [];
-  if (!queue.length) return;
-  log(`LIVRAISON ${queue.length} message(s) en attente livrés à ${id}`);
-  for (const env of queue) {
-    socket.send(JSON.stringify(env));
-    broadcastTransaction({
-      from: env.from, to: env.to, action: 'envelope_delivered_late',
-      type: env.kind && env.kind !== 'data' ? env.kind : (env.type || 'data'),
-      status: 'ok', data: env,
-    });
-  }
-  pending.delete(id);
-  saveState();
+  retryPendingFor(id, { force: true });
 }
 
 function handlePairRequest(msg) {
@@ -284,8 +275,14 @@ function syncLinksOnConnect(id) {
   }
 }
 
-function handleEnvelope(msg) {
+function isLinked(fromId, toId) {
+  return links.has(fromId) && links.get(fromId).has(toId);
+}
+
+
+function handleEnvelope(socket, msg) {
   const effectiveType = msg.kind && msg.kind !== 'data' ? msg.kind : (msg.type || 'data');
+  socket.send(JSON.stringify({ action: 'envelope_ack', from: msg.from, to: msg.to, seq: msg.seq }));
 
   if (!isLinked(msg.from, msg.to)) {
     log(`REFUS     ${msg.from} -> ${msg.to} (aucun lien valide en base, message rejeté)`);
@@ -299,38 +296,57 @@ function handleEnvelope(msg) {
   log(`ROUTAGE   ${msg.from} -> ${msg.to}  ${label} seq=${msg.seq}  ` +
       `payload chiffré (${msg.ciphertext.length} car. base64, illisible ici)`);
 
-  const targetUser = users.get(msg.to);
-  const delivered = !!targetUser && targetUser.socket.readyState === WebSocket.OPEN;
-  routeEnvelope(msg);
-  broadcastTransaction({
-    from: msg.from, to: msg.to, action: 'envelope', type: effectiveType,
-    status: delivered ? 'routed' : 'queued', data: msg,
-  });
+  queueAndDeliver(msg);
+  broadcastTransaction({ from: msg.from, to: msg.to, action: 'envelope', type: effectiveType, status: 'queued', data: msg });
 }
 
-function isLinked(fromId, toId) {
-  return links.has(fromId) && links.get(fromId).has(toId);
-}
-
-function routeEnvelope(msg) {
-  const target = users.get(msg.to);
-  if (target && target.socket.readyState === WebSocket.OPEN && target.socket.isAlive !== false) {
-    target.socket.send(JSON.stringify(msg), (err) => {
-      if (err) queuePendingEnvelope(msg);
-    });
-    return;
-  }
-  queuePendingEnvelope(msg);
-}
-
-function queuePendingEnvelope(msg) {
+function queueAndDeliver(msg) {
   const q = pending.get(msg.to) || [];
-  q.push(msg);
-  pending.set(msg.to, q);
-  saveState();
-  log(`ATTENTE   ${msg.to} hors ligne, message mis en file d'attente`);
+  const dup = q.find((e) => e.msg.from === msg.from && e.msg.seq === msg.seq);
+  const entry = dup || { msg, sentAt: 0 };
+  if (!dup) {
+    q.push(entry);
+    pending.set(msg.to, q);
+    saveState();
+  }
+  attemptSend(msg.to, entry);
 }
 
+function attemptSend(id, entry) {
+  const target = users.get(id);
+  if (!target || target.socket.readyState !== WebSocket.OPEN) return;
+  entry.sentAt = Date.now();
+  target.socket.send(JSON.stringify(entry.msg));
+}
+
+function retryPendingFor(id, { force = false } = {}) {
+  const q = pending.get(id);
+  if (!q || !q.length) return;
+  const target = users.get(id);
+  if (!target || target.socket.readyState !== WebSocket.OPEN) return;
+  const now = Date.now();
+  let sent = 0;
+  for (const entry of q) {
+    if (!force && now - entry.sentAt < RETRY_INTERVAL_MS) continue;
+    entry.sentAt = now;
+    target.socket.send(JSON.stringify(entry.msg));
+    sent++;
+  }
+  if (sent) log(`RETENTE   ${sent} enveloppe(s) retentée(s) vers ${id}`);
+}
+
+function handleEnvelopeAck(connState, msg) {
+  const id = connState.myId;
+  if (!id) return;
+  const q = pending.get(id);
+  if (!q) return;
+  const idx = q.findIndex((e) => e.msg.from === msg.from && e.msg.seq === msg.seq);
+  if (idx === -1) return;
+  q.splice(idx, 1);
+  if (q.length) pending.set(id, q); else pending.delete(id);
+  saveState();
+  broadcastTransaction({ from: msg.from, to: id, action: 'envelope_ack', data: msg });
+}
 
 function handleDisconnect(id, socket) {
   if (!id) return;
@@ -345,9 +361,6 @@ function handleDisconnect(id, socket) {
 
 function dispatch(socket, connState, msg) {
   switch (msg.action) {
-    case 'ping':
-      socket.send(JSON.stringify({ action: 'pong' }));
-      break;
     case 'admin_subscribe': {
       if (!ADMIN_TOKEN || msg.token !== ADMIN_TOKEN) {
         socket.send(JSON.stringify({ action: 'admin_denied' }));
@@ -359,7 +372,7 @@ function dispatch(socket, connState, msg) {
       loadTransactionHistory().then((history) => {
         if (socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify({ action: 'admin_history', events: history }));
-        adminSockets.add(socket); // ajouté APRES l'envoi de l'historique pour éviter le doublon d'un évènement arrivé entre-temps
+        adminSockets.add(socket);
       });
       break;
     }
@@ -373,7 +386,10 @@ function dispatch(socket, connState, msg) {
       handlePairRequest(msg);
       break;
     case 'envelope':
-      handleEnvelope(msg);
+      handleEnvelope(socket, msg);
+      break;
+    case 'envelope_ack':
+      handleEnvelopeAck(connState, msg);
       break;
     default:
       log(`INCONNU   action non reconnue: ${msg.action}`);
@@ -435,11 +451,7 @@ function startServer() {
     const connState = { myId: null, isAdmin: false };
 
     socket.isAlive = true;
-    socket.on('pong', () => {
-      const wasSuspectedZombie = socket.isAlive === false;
-      socket.isAlive = true;
-      if (wasSuspectedZombie && connState.myId) deliverPendingMessages(connState.myId, socket);
-    });
+    socket.on('pong', () => { socket.isAlive = true; });
 
     socket.on('message', (raw) => {
       const msg = parseMessage(raw);
@@ -464,6 +476,10 @@ function startServer() {
     }
   }, 30000);
   wss.on('close', () => clearInterval(heartbeat));
+
+  const retryTimer = setInterval(() => {
+    for (const id of pending.keys()) retryPendingFor(id);
+  }, RETRY_INTERVAL_MS);
 
   httpServer.listen(PORT, () => {
     log(`Serveur démarré (port ${PORT}, stockage: ${USE_REDIS ? 'Upstash Redis' : 'disque local'})`);
